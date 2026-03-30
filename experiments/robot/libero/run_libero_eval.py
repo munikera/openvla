@@ -23,6 +23,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
+# ── Must be set BEFORE torch/Level-Zero initializes ──────────────────────────────
+# When ZE_AFFINITY_MASK is unset, Level-Zero enumerates ALL GPUs and installs
+# global memory hooks for each one. That multi-card global state corrupts
+# osmesa's allocator, causing a segfault inside OffScreenRenderEnv.
+# Setting it to any single card index prevents the multi-card enumeration.
+os.environ.setdefault("ZE_AFFINITY_MASK", "0")
+
 # ── Import tensorflow BEFORE torch to avoid LLVM duplicate-symbol abort ─────────
 import tensorflow as _tf  # noqa: F401
 # ────────────────────────────────────────────────────────────────────────────────
@@ -52,7 +59,10 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 
-# ── Subprocess-based LIBERO env proxy (avoids MKL-SYCL vs osmesa segfault) ──────
+# ── Subprocess-based LIBERO env proxy ────────────────────────────────────────────
+# Loading the 7B model onto XPU (via torch_ipex / Level-Zero) installs global
+# memory hooks that corrupt osmesa's CPU allocator.  Running LIBERO in a fresh
+# subprocess (which never imports torch) keeps the two memory spaces separate.
 import base64
 import pickle
 import subprocess
@@ -60,27 +70,24 @@ import time
 
 
 class LiberoEnvProxy:
-    """Wraps the LIBERO env running in a clean subprocess (no torch/MKL loaded)."""
+    """Wraps the LIBERO env in a clean subprocess (no torch/Level-Zero loaded)."""
 
     def __init__(self, task_suite_name: str, task_id: int, resolution: int = 256):
         worker = Path(__file__).parent / "libero_env_worker.py"
-        # Build a clean env: inherit everything EXCEPT GL-related vars which we force to osmesa
         clean_env = {k: v for k, v in os.environ.items()
                      if k not in ("MUJOCO_GL", "PYOPENGL_PLATFORM", "EGL_DEVICE_ID", "DISPLAY")}
         clean_env["MUJOCO_GL"] = "osmesa"
         clean_env["PYOPENGL_PLATFORM"] = "osmesa"
-        clean_env["ZE_AFFINITY_MASK"] = "1"  # pin worker to card 1, leaving card 0 for model inference
         self._proc = subprocess.Popen(
             [sys.executable, str(worker)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,  # inherit terminal stderr so worker warnings are visible and don't block
+            stderr=None,
             env=clean_env,
             text=True,
         )
         resp = self._recv()
         assert resp["status"] == "ready"
-
         self._send({"cmd": "make_env", "task_suite_name": task_suite_name,
                     "task_id": task_id, "resolution": resolution})
         resp = self._recv()
@@ -96,7 +103,7 @@ class LiberoEnvProxy:
     def _recv(self):
         line = self._proc.stdout.readline()
         if not line:
-            raise RuntimeError("Worker subprocess died unexpectedly — check stderr output above.")
+            raise RuntimeError("Worker subprocess died — check stderr above.")
         return pickle.loads(base64.b64decode(line.strip()))
 
     def reset(self, episode_idx: int):
@@ -114,22 +121,18 @@ class LiberoEnvProxy:
 
 
 def get_num_tasks(task_suite_name: str) -> int:
-    """Ask a temporary worker subprocess for the task count (avoids loading libero into main process)."""
     worker = Path(__file__).parent / "libero_env_worker.py"
     clean_env = {k: v for k, v in os.environ.items()
                  if k not in ("MUJOCO_GL", "PYOPENGL_PLATFORM", "EGL_DEVICE_ID", "DISPLAY")}
     clean_env["MUJOCO_GL"] = "osmesa"
     clean_env["PYOPENGL_PLATFORM"] = "osmesa"
-    clean_env["ZE_AFFINITY_MASK"] = "1"
     proc = subprocess.Popen(
         [sys.executable, str(worker)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
         env=clean_env, text=True,
     )
-    # wait for ready
     resp = pickle.loads(base64.b64decode(proc.stdout.readline().strip()))
     assert resp["status"] == "ready"
-    # query num tasks
     proc.stdin.write(base64.b64encode(pickle.dumps(
         {"cmd": "get_num_tasks", "task_suite_name": task_suite_name}
     )).decode() + "\n")
@@ -139,7 +142,7 @@ def get_num_tasks(task_suite_name: str) -> int:
     proc.stdin.flush()
     proc.wait()
     return resp["num_tasks"]
-# ────────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -196,11 +199,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # [OpenVLA] Set action un-normalization key (use override if provided, else default to task suite name)
     cfg.unnorm_key = cfg.unnorm_key if cfg.unnorm_key is not None else cfg.task_suite_name
 
-    # Get number of tasks (without loading env)
+    # Get number of tasks via a short-lived worker subprocess (libero must not be imported here)
     num_tasks_in_suite = get_num_tasks(cfg.task_suite_name)
     print(f"Task suite: {cfg.task_suite_name} ({num_tasks_in_suite} tasks)")
 
-    # Load model (torch/MKL-SYCL stay in this process; envs run in clean subprocesses)
+    # Load model
     model = get_model(cfg)
 
     # [OpenVLA] Check that the model contains the action un-normalization key
@@ -239,7 +242,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     total_episodes, total_successes = 0, 0
     per_task_results = []  # list of (task_description, successes, episodes)
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
-        # Initialize LIBERO environment in a clean subprocess (no MKL-SYCL conflict with osmesa)
+        # Initialize LIBERO environment in a clean subprocess (no torch/Level-Zero loaded)
         env = LiberoEnvProxy(cfg.task_suite_name, task_id, resolution=256)
         task_description = env.task_description
 
@@ -349,7 +352,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
             log_file.flush()
 
-        # Close env subprocess before moving to next task
+        # Close env before moving to next task
         env.close()
 
         per_task_results.append((task_description, task_successes, task_episodes, task_steps))
