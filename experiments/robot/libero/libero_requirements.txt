@@ -1,6 +1,79 @@
-imageio[ffmpeg]
-robosuite==1.4.1
-bddl
+# ── 1. PyTorch XPU (Intel Arc) ────────────────────────────────────────────────
+# Must use XPU wheels — standard PyPI torch has no XPU backend
+--extra-index-url https://download.pytorch.org/whl/xpu
+torch==2.10.0+xpu
+torchvision==0.25.0+xpu
+torchaudio==2.10.0+xpu
+
+# ── 2. Core ML / HuggingFace ──────────────────────────────────────────────────
+transformers==4.40.1        # Pinned: >4.40.1 breaks attention_mask in cached generate() on XPU
+accelerate==1.12.0
+huggingface_hub==0.36.2
+timm==0.9.10                # Vision backbone (DINOv2/SigLIP); newer versions break compatibility
+sentencepiece==0.1.99       # Tokenizer dependency
+tokenizers==0.19.1
+peft==0.11.1                # LoRA fine-tuning support
+
+# ── 3. Image processing ───────────────────────────────────────────────────────
+pillow
+tensorflow-cpu              # Used ONLY for image preprocessing (tf.image.resize with lanczos3)
+                            # matching training pipeline — no XPU/GPU needed for this
+
+# ── 4. Scientific / utility ───────────────────────────────────────────────────
+numpy
+einops
+matplotlib
+imageio[ffmpeg]             # Saving rollout videos
+opencv-python-headless      # Required by robosuite (headless variant — no display needed)
+
+# ── 5. Config / logging ───────────────────────────────────────────────────────
+draccus                     # CLI config decorator used by run_libero_eval.py
+wandb                       # Optional: pass --use_wandb True to enable
+tqdm
+rich
+
+# ── 6. LIBERO simulation stack ────────────────────────────────────────────────
+# robosuite and libero MUST be installed with --no-deps to avoid pulling:
+#   - egl_probe (broken CMakeLists.txt, fails to build with CMake >= 3.5)
+#   - robosuite>=1.4.1 (incompatible with LIBERO — use exactly 1.4.0)
+#
+# pip requirements files do not support per-line --no-deps, so run these
+# two commands MANUALLY before (or after) pip install -r this file:
+#
+#   pip install robosuite==1.4.0 --no-deps
+#   pip install libero --no-deps
+#
+# Everything else below can be installed normally via this file.
+
+# Listed here for reference only (installed manually above with --no-deps):
+# robosuite==1.4.0
+# libero
+mujoco==3.1.6                # PINNED: 3.6.0 has AVX-512 null-ptr segfault in osmesa on Intel Arc
+numba                        # Required by robosuite.utils.transform_utils (JIT decorator)
+scipy                        # Required by numba for linalg (numpy.linalg.eigh etc.)
+pynput                       # Required by robosuite (keyboard/mouse input handling)
+bddl                         # BDDL task description language (libero needs bddl, but version matters)
 easydict
 cloudpickle
 gym
+gymnasium>=0.29.0
+
+# ── 7. System libraries (install via apt, not pip) ────────────────────────────
+# These must be installed at the OS level before running:
+#
+#   sudo apt-get install -y libgl1 libglib2.0-0t64 libosmesa6-dev
+#
+# libgl1          : OpenGL runtime (needed by cv2/robosuite)
+# libglib2.0-0t64 : GLib runtime
+# libosmesa6-dev  : Software offscreen OpenGL renderer (MUJOCO_GL=osmesa)
+#                   Required for headless/no-display server rendering
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# - bitsandbytes (8-bit/4-bit quantization) is CUDA-only → NOT installed here
+# - flash-attn is CUDA-only → NOT installed here
+#   openvla_utils.py has been patched to use attn_implementation="eager" on XPU
+# - dlimp (RLDS training data loader) is NOT needed for eval
+#   prismatic/__init__.py has been patched with lazy imports to avoid loading
+#   the training pipeline when only running inference/eval
+# - egl_probe build will FAIL (broken CMakeLists.txt) — this is expected and safe
+#   hf-egl-probe installs successfully and covers the same functionality

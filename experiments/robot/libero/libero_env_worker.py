@@ -14,19 +14,6 @@ import pickle
 import sys
 
 
-def send(obj):
-    data = base64.b64encode(pickle.dumps(obj)).decode("ascii")
-    sys.stdout.write(data + "\n")
-    sys.stdout.flush()
-
-
-def recv():
-    line = sys.stdin.readline()
-    if not line:
-        return None
-    return pickle.loads(base64.b64decode(line.strip()))
-
-
 def main():
     # Force osmesa BEFORE any mujoco/libero/OpenGL import — must happen first
     os.environ["MUJOCO_GL"] = "osmesa"

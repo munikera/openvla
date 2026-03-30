@@ -6,6 +6,8 @@ import os
 import imageio
 import numpy as np
 import tensorflow as tf
+from libero.libero import get_libero_path
+from libero.libero.envs import OffScreenRenderEnv
 
 from experiments.robot.robot_utils import (
     DATE,
@@ -15,16 +17,9 @@ from experiments.robot.robot_utils import (
 
 def get_libero_env(task, model_family, resolution=256):
     """Initializes and returns the LIBERO environment, along with the task description."""
-    from libero.libero import get_libero_path  # lazy: keep libero/robosuite out of main process
-    from libero.libero.envs import OffScreenRenderEnv  # lazy: avoid loading OpenGL at import time
     task_description = task.language
     task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
-    env_args = {
-        "bddl_file_name": task_bddl_file,
-        "camera_heights": resolution,
-        "camera_widths": resolution,
-        "render_gpu_device_id": -1,  # -1 = software/osmesa rendering (no GPU EGL context needed)
-    }
+    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
     env = OffScreenRenderEnv(**env_args)
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
