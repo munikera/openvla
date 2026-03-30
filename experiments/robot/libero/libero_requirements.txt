@@ -9,6 +9,7 @@ torchaudio==2.10.0+xpu
 transformers==4.40.1        # Pinned: >4.40.1 breaks attention_mask in cached generate() on XPU
 accelerate==1.12.0
 huggingface_hub==0.36.2
+hf_transfer                 # Optional fast HF downloader (required if HF_HUB_ENABLE_HF_TRANSFER=1 is set)
 timm==0.9.10                # Vision backbone (DINOv2/SigLIP); newer versions break compatibility
 sentencepiece==0.1.99       # Tokenizer dependency
 tokenizers==0.19.1
