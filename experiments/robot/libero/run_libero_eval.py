@@ -240,7 +240,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    per_task_results = []  # list of (task_description, successes, episodes)
+    total_steps_all = 0  # cumulative steps across all tasks
+    per_task_results = []  # list of (task_description, successes, episodes, steps, avg_inf_s)
+    all_inference_times = []  # accumulates every step time across ALL tasks (for final summary)
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Initialize LIBERO environment in a clean subprocess (no torch/Level-Zero loaded)
         env = LiberoEnvProxy(cfg.task_suite_name, task_id, resolution=256)
@@ -249,7 +251,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
         # Start episodes
         task_episodes, task_successes = 0, 0
         task_steps = 0  # total inference steps (excluding wait steps) across all episodes in this task
-        inference_times = []  # track per-step inference latency (seconds)
+        inference_times = []  # track per-step inference latency (seconds) — reset each task
         for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
@@ -275,6 +277,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
+            ep_inf_times = []  # per-step times for THIS episode only
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -309,6 +312,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         processor=processor,
                     )
                     inference_times.append(time.perf_counter() - t0)
+                    ep_inf_times.append(inference_times[-1])
+                    all_inference_times.append(inference_times[-1])
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -335,8 +340,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
             task_episodes += 1
             total_episodes += 1
             task_steps += episode_steps
-            _cur_avg_inf = np.mean(inference_times) if inference_times else 0.0
-            ep_inf_s = episode_steps * _cur_avg_inf
+            # Ideal calculation: average of this episode's step times × steps in this episode
+            ep_avg_inf = np.mean(ep_inf_times) if ep_inf_times else 0.0
+            ep_inf_s = episode_steps * ep_avg_inf
 
             # Save a replay video of the episode
             save_rollout_video(
@@ -344,10 +350,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
             )
 
             # Log current results
-            print(f"Success: {done}  |  steps: {episode_steps}  |  est. inf. time: {ep_inf_s:.1f}s")
+            print(f"Success: {done}  |  steps: {episode_steps}  |  total steps so far: {task_steps}  |  inf. time: {ep_inf_s:.1f}s  ({ep_avg_inf*1000:.1f} ms/step)")
             print(f"# episodes completed so far: {total_episodes}")
             print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
-            log_file.write(f"Success: {done} | steps: {episode_steps} | est_inf_time: {ep_inf_s:.1f}s\n")
+            log_file.write(f"Success: {done} | steps: {episode_steps} | total_steps_so_far: {task_steps} | inf_time: {ep_inf_s:.1f}s ({ep_avg_inf*1000:.1f} ms/step)\n")
             log_file.write(f"# episodes completed so far: {total_episodes}\n")
             log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
             log_file.flush()
@@ -355,17 +361,19 @@ def eval_libero(cfg: GenerateConfig) -> None:
         # Close env before moving to next task
         env.close()
 
-        per_task_results.append((task_description, task_successes, task_episodes, task_steps))
+        task_avg_inf = np.mean(inference_times) if inference_times else 0.0
+        task_inf_s = sum(inference_times)  # exact sum for this task
+        per_task_results.append((task_description, task_successes, task_episodes, task_steps, task_avg_inf))
+        total_steps_all += task_steps
 
         # Log final results
         task_sr = float(task_successes) / float(task_episodes)
         total_sr = float(total_successes) / float(total_episodes)
         avg_task_steps = task_steps / task_episodes
-        task_inf_s = task_steps * (np.mean(inference_times) if inference_times else 0.0)
         print(f"\n[Task {task_id+1}/{num_tasks_in_suite}] '{task_description}'")
         print(f"  Success rate      : {task_successes}/{task_episodes} = {task_sr*100:.1f}%")
-        print(f"  Avg steps/episode : {avg_task_steps:.1f}  |  Total steps: {task_steps}")
-        print(f"  Est. inf. time    : {task_inf_s:.1f}s  ({task_inf_s/task_episodes:.1f}s avg/episode)")
+        print(f"  Avg steps/episode : {avg_task_steps:.1f}  |  Total steps (this task): {task_steps}  |  Cumulative steps: {total_steps_all}")
+        print(f"  Inf. time         : {task_inf_s:.1f}s  ({task_inf_s/task_episodes:.1f}s avg/episode)  |  {task_avg_inf*1000:.1f} ms/step")
         print(f"  Running total     : {total_successes}/{total_episodes} = {total_sr*100:.1f}%")
         log_file.write(f"Current task success rate: {task_sr}\n")
         log_file.write(f"Current total success rate: {total_sr}\n")
@@ -380,25 +388,25 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # Save local log file
     # ── Final benchmark summary table ────────────────────────────────────────────
-    avg_inf = np.mean(inference_times) if inference_times else 0.0
+    avg_inf = np.mean(all_inference_times) if all_inference_times else 0.0  # mean across ALL tasks/episodes
     inf_hz  = 1.0 / avg_inf if avg_inf > 0 else 0.0
-    total_steps = sum(s for _, _, _, s in per_task_results)
-    total_inf_s = total_steps * avg_inf
+    total_steps = sum(s for _, _, _, s, _ in per_task_results)
+    total_inf_s = sum(all_inference_times)  # exact sum, not an estimate
     summary_lines = [
         "",
         "=" * 90,
         f"  BENCHMARK RESULTS — {cfg.task_suite_name}",
         f"  Checkpoint : {cfg.pretrained_checkpoint}",
         f"  Inference  : {avg_inf*1000:.1f} ms/step  →  {inf_hz:.2f} Hz  (steps/sec)",
-        f"  Total steps: {total_steps}  |  Est. total inference time: {total_inf_s:.0f}s  ({total_inf_s/60:.1f} min)",
+        f"  Total steps: {total_steps}  |  Total inference time: {total_inf_s:.0f}s  ({total_inf_s/60:.1f} min)",
         "=" * 90,
         f"  {'Task':<45} {'SR':>7} {'Succ':>5} {'Eps':>5} {'Steps':>7} {'Steps/Ep':>9} {'InfTime':>9}",
         "-" * 90,
     ]
-    for desc, succ, eps, steps in per_task_results:
+    for desc, succ, eps, steps, task_avg in per_task_results:
         sr = succ / eps * 100
         avg_steps = steps / eps
-        inf_s = steps * avg_inf
+        inf_s = steps * task_avg  # exact: mean(this task's steps) × count = sum(this task's times)
         summary_lines.append(
             f"  {desc:<45} {sr:>6.1f}% {succ:>5} {eps:>5} {steps:>7} {avg_steps:>9.1f} {inf_s:>8.1f}s"
         )
