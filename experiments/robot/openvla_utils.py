@@ -18,7 +18,18 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 ACTION_DIM = 7
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+
+# Device selection: prefer XPU (Intel Arc), then CUDA, then CPU.
+if hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEVICE = torch.device("xpu:0")
+    _XPU = True
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda:0")
+    _XPU = False
+else:
+    DEVICE = torch.device("cpu")
+    _XPU = False
+
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
 
 # Initialize system prompt for OpenVLA v0.1.
@@ -32,7 +43,6 @@ def get_vla(cfg):
     """Loads and returns a VLA model from checkpoint."""
     # Load VLA checkpoint.
     print("[*] Instantiating Pretrained VLA model")
-    print("[*] Loading in BF16 with Flash-Attention Enabled")
 
     # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -40,20 +50,42 @@ def get_vla(cfg):
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
-        attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
-        load_in_8bit=cfg.load_in_8bit,
-        load_in_4bit=cfg.load_in_4bit,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
+    # XPU (Intel Arc) does not support Flash-Attention (CUDA-only) or bitsandbytes
+    # quantization (CUDA-only).  Fall back to eager attention on XPU; keep the
+    # original flash_attention_2 + quantization path for CUDA.
+    if _XPU:
+        print("[*] Loading in BF16 with Eager Attention (XPU — Flash-Attn not supported)")
+        if cfg.load_in_8bit or cfg.load_in_4bit:
+            print(
+                "WARNING: bitsandbytes quantization (8-bit / 4-bit) is CUDA-only and cannot "
+                "run on XPU. Falling back to full bfloat16 precision."
+            )
+        vla = AutoModelForVision2Seq.from_pretrained(
+            cfg.pretrained_checkpoint,
+            attn_implementation="eager",   # Flash-Attn is CUDA-only
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+    else:
+        print("[*] Loading in BF16 with Flash-Attention Enabled")
+        vla = AutoModelForVision2Seq.from_pretrained(
+            cfg.pretrained_checkpoint,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            load_in_8bit=cfg.load_in_8bit,
+            load_in_4bit=cfg.load_in_4bit,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
 
     # Move model to device.
     # Note: `.to()` is not supported for 8-bit or 4-bit bitsandbytes models, but the model will
     #       already be set to the right devices and casted to the correct dtype upon loading.
     if not cfg.load_in_8bit and not cfg.load_in_4bit:
+        vla = vla.to(DEVICE)
+    elif _XPU:
+        # Quantization was skipped above; always move to XPU.
         vla = vla.to(DEVICE)
 
     # Load dataset stats used during finetuning (for action un-normalization).
@@ -163,7 +195,15 @@ def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, c
         prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
 
     # Process inputs.
+    # NOTE: We drop 'attention_mask' when running on XPU.
+    # In transformers > 4.40.1, generate() extends the attention_mask by 1 token per
+    # decode step during cached generation, going out of sync with the KV-cache length:
+    #   RuntimeError: size of tensor a (283) must match tensor b (282) at dim 3
+    # Dropping it lets LLaMA use its built-in causal mask, which works for both the
+    # full first pass and all subsequent cached decode steps.
     inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
+    if _XPU and "attention_mask" in inputs:
+        del inputs["attention_mask"]
 
     # Get action.
     action = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)

@@ -23,10 +23,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
+# ── Must be set BEFORE torch/Level-Zero initializes ──────────────────────────────
+# When ZE_AFFINITY_MASK is unset, Level-Zero enumerates ALL GPUs and installs
+# global memory hooks for each one. That multi-card global state corrupts
+# osmesa's allocator, causing a segfault inside OffScreenRenderEnv.
+# Setting it to any single card index prevents the multi-card enumeration.
+os.environ.setdefault("ZE_AFFINITY_MASK", "0")
+
+# ── Import tensorflow BEFORE torch to avoid LLVM duplicate-symbol abort ─────────
+import tensorflow as _tf  # noqa: F401
+# ────────────────────────────────────────────────────────────────────────────────
+
 import draccus
 import numpy as np
 import tqdm
-from libero.libero import benchmark
 
 import wandb
 
@@ -34,7 +44,6 @@ import wandb
 sys.path.append("../..")
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
-    get_libero_env,
     get_libero_image,
     quat2axisangle,
     save_rollout_video,
@@ -50,6 +59,91 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 
+# ── Subprocess-based LIBERO env proxy ────────────────────────────────────────────
+# Loading the 7B model onto XPU (via torch_ipex / Level-Zero) installs global
+# memory hooks that corrupt osmesa's CPU allocator.  Running LIBERO in a fresh
+# subprocess (which never imports torch) keeps the two memory spaces separate.
+import base64
+import pickle
+import subprocess
+import time
+
+
+class LiberoEnvProxy:
+    """Wraps the LIBERO env in a clean subprocess (no torch/Level-Zero loaded)."""
+
+    def __init__(self, task_suite_name: str, task_id: int, resolution: int = 256):
+        worker = Path(__file__).parent / "libero_env_worker.py"
+        clean_env = {k: v for k, v in os.environ.items()
+                     if k not in ("MUJOCO_GL", "PYOPENGL_PLATFORM", "EGL_DEVICE_ID", "DISPLAY")}
+        clean_env["MUJOCO_GL"] = "osmesa"
+        clean_env["PYOPENGL_PLATFORM"] = "osmesa"
+        self._proc = subprocess.Popen(
+            [sys.executable, str(worker)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            env=clean_env,
+            text=True,
+        )
+        resp = self._recv()
+        assert resp["status"] == "ready"
+        self._send({"cmd": "make_env", "task_suite_name": task_suite_name,
+                    "task_id": task_id, "resolution": resolution})
+        resp = self._recv()
+        assert resp["status"] == "ok"
+        self.task_description = resp["task_description"]
+        self.n_initial_states = resp["n_initial_states"]
+
+    def _send(self, obj):
+        data = base64.b64encode(pickle.dumps(obj)).decode("ascii")
+        self._proc.stdin.write(data + "\n")
+        self._proc.stdin.flush()
+
+    def _recv(self):
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError("Worker subprocess died — check stderr above.")
+        return pickle.loads(base64.b64decode(line.strip()))
+
+    def reset(self, episode_idx: int):
+        self._send({"cmd": "reset", "episode_idx": episode_idx})
+        return self._recv()["obs"]
+
+    def step(self, action):
+        self._send({"cmd": "step", "action": action})
+        r = self._recv()
+        return r["obs"], r["reward"], r["done"], r["info"]
+
+    def close(self):
+        self._send({"cmd": "exit"})
+        self._proc.wait()
+
+
+def get_num_tasks(task_suite_name: str) -> int:
+    worker = Path(__file__).parent / "libero_env_worker.py"
+    clean_env = {k: v for k, v in os.environ.items()
+                 if k not in ("MUJOCO_GL", "PYOPENGL_PLATFORM", "EGL_DEVICE_ID", "DISPLAY")}
+    clean_env["MUJOCO_GL"] = "osmesa"
+    clean_env["PYOPENGL_PLATFORM"] = "osmesa"
+    proc = subprocess.Popen(
+        [sys.executable, str(worker)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+        env=clean_env, text=True,
+    )
+    resp = pickle.loads(base64.b64decode(proc.stdout.readline().strip()))
+    assert resp["status"] == "ready"
+    proc.stdin.write(base64.b64encode(pickle.dumps(
+        {"cmd": "get_num_tasks", "task_suite_name": task_suite_name}
+    )).decode() + "\n")
+    proc.stdin.flush()
+    resp = pickle.loads(base64.b64decode(proc.stdout.readline().strip()))
+    proc.stdin.write(base64.b64encode(pickle.dumps({"cmd": "exit"})).decode() + "\n")
+    proc.stdin.flush()
+    proc.wait()
+    return resp["num_tasks"]
+# ─────────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class GenerateConfig:
@@ -64,6 +158,11 @@ class GenerateConfig:
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
+
+    unnorm_key: Optional[str] = None                 # Action un-normalization key override. Defaults to task_suite_name.
+                                                     # Use "bridge_orig" with the base openvla/openvla-7b checkpoint
+                                                     # (which has no LIBERO stats). A LIBERO fine-tuned checkpoint
+                                                     # will have the task suite name as the key automatically.
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -97,16 +196,18 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # Set random seed
     set_seed_everywhere(cfg.seed)
 
-    # [OpenVLA] Set action un-normalization key
-    cfg.unnorm_key = cfg.task_suite_name
+    # [OpenVLA] Set action un-normalization key (use override if provided, else default to task suite name)
+    cfg.unnorm_key = cfg.unnorm_key if cfg.unnorm_key is not None else cfg.task_suite_name
+
+    # Get number of tasks via a short-lived worker subprocess (libero must not be imported here)
+    num_tasks_in_suite = get_num_tasks(cfg.task_suite_name)
+    print(f"Task suite: {cfg.task_suite_name} ({num_tasks_in_suite} tasks)")
 
     # Load model
     model = get_model(cfg)
 
     # [OpenVLA] Check that the model contains the action un-normalization key
     if cfg.model_family == "openvla":
-        # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
-        # with the suffix "_no_noops" in the dataset name)
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
             cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
         assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
@@ -124,6 +225,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
+    log_file.write(f"Task suite: {cfg.task_suite_name}\n")
 
     # Initialize Weights & Biases logging as well
     if cfg.use_wandb:
@@ -133,43 +235,35 @@ def eval_libero(cfg: GenerateConfig) -> None:
             name=run_id,
         )
 
-    # Initialize LIBERO task suite
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[cfg.task_suite_name]()
-    num_tasks_in_suite = task_suite.n_tasks
-    print(f"Task suite: {cfg.task_suite_name}")
-    log_file.write(f"Task suite: {cfg.task_suite_name}\n")
-
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    total_steps_all = 0  # cumulative steps across all tasks
+    per_task_results = []  # list of (task_description, successes, episodes, steps, avg_inf_s)
+    all_inference_times = []  # accumulates every step time across ALL tasks (for final summary)
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
-        # Get task
-        task = task_suite.get_task(task_id)
-
-        # Get default LIBERO initial states
-        initial_states = task_suite.get_task_init_states(task_id)
-
-        # Initialize LIBERO environment and task description
-        env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
+        # Initialize LIBERO environment in a clean subprocess (no torch/Level-Zero loaded)
+        env = LiberoEnvProxy(cfg.task_suite_name, task_id, resolution=256)
+        task_description = env.task_description
 
         # Start episodes
         task_episodes, task_successes = 0, 0
+        task_steps = 0  # total inference steps (excluding wait steps) across all episodes in this task
+        inference_times = []  # track per-step inference latency (seconds) — reset each task
         for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
 
-            # Reset environment
-            env.reset()
-
-            # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
+            # Reset environment and set initial state
+            obs = env.reset(episode_idx)
 
             # Setup
             t = 0
+            episode_steps = 0  # inference steps this episode (excludes num_steps_wait)
             replay_images = []
+            done = False
             if cfg.task_suite_name == "libero_spatial":
                 max_steps = 220  # longest training demo has 193 steps
             elif cfg.task_suite_name == "libero_object":
@@ -183,6 +277,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
+            ep_inf_times = []  # per-step times for THIS episode only
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -208,6 +303,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     }
 
                     # Query model to get action
+                    t0 = time.perf_counter()
                     action = get_action(
                         cfg,
                         model,
@@ -215,6 +311,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         task_description,
                         processor=processor,
                     )
+                    inference_times.append(time.perf_counter() - t0)
+                    ep_inf_times.append(inference_times[-1])
+                    all_inference_times.append(inference_times[-1])
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -226,6 +325,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
+                    episode_steps += 1
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -239,6 +339,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             task_episodes += 1
             total_episodes += 1
+            task_steps += episode_steps
+            # Ideal calculation: average of this episode's step times × steps in this episode
+            ep_avg_inf = np.mean(ep_inf_times) if ep_inf_times else 0.0
+            ep_inf_s = episode_steps * ep_avg_inf
 
             # Save a replay video of the episode
             save_rollout_video(
@@ -246,19 +350,33 @@ def eval_libero(cfg: GenerateConfig) -> None:
             )
 
             # Log current results
-            print(f"Success: {done}")
+            print(f"Success: {done}  |  steps: {episode_steps}  |  total steps so far: {task_steps}  |  inf. time: {ep_inf_s:.1f}s  ({ep_avg_inf*1000:.1f} ms/step)")
             print(f"# episodes completed so far: {total_episodes}")
             print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
-            log_file.write(f"Success: {done}\n")
+            log_file.write(f"Success: {done} | steps: {episode_steps} | total_steps_so_far: {task_steps} | inf_time: {ep_inf_s:.1f}s ({ep_avg_inf*1000:.1f} ms/step)\n")
             log_file.write(f"# episodes completed so far: {total_episodes}\n")
             log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
             log_file.flush()
 
+        # Close env before moving to next task
+        env.close()
+
+        task_avg_inf = np.mean(inference_times) if inference_times else 0.0
+        task_inf_s = sum(inference_times)  # exact sum for this task
+        per_task_results.append((task_description, task_successes, task_episodes, task_steps, task_avg_inf))
+        total_steps_all += task_steps
+
         # Log final results
-        print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
-        log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
-        log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
+        task_sr = float(task_successes) / float(task_episodes)
+        total_sr = float(total_successes) / float(total_episodes)
+        avg_task_steps = task_steps / task_episodes
+        print(f"\n[Task {task_id+1}/{num_tasks_in_suite}] '{task_description}'")
+        print(f"  Success rate      : {task_successes}/{task_episodes} = {task_sr*100:.1f}%")
+        print(f"  Avg steps/episode : {avg_task_steps:.1f}  |  Total steps (this task): {task_steps}  |  Cumulative steps: {total_steps_all}")
+        print(f"  Inf. time         : {task_inf_s:.1f}s  ({task_inf_s/task_episodes:.1f}s avg/episode)  |  {task_avg_inf*1000:.1f} ms/step")
+        print(f"  Running total     : {total_successes}/{total_episodes} = {total_sr*100:.1f}%")
+        log_file.write(f"Current task success rate: {task_sr}\n")
+        log_file.write(f"Current total success rate: {total_sr}\n")
         log_file.flush()
         if cfg.use_wandb:
             wandb.log(
@@ -269,6 +387,40 @@ def eval_libero(cfg: GenerateConfig) -> None:
             )
 
     # Save local log file
+    # ── Final benchmark summary table ────────────────────────────────────────────
+    avg_inf = np.mean(all_inference_times) if all_inference_times else 0.0  # mean across ALL tasks/episodes
+    inf_hz  = 1.0 / avg_inf if avg_inf > 0 else 0.0
+    total_steps = sum(s for _, _, _, s, _ in per_task_results)
+    total_inf_s = sum(all_inference_times)  # exact sum, not an estimate
+    summary_lines = [
+        "",
+        "=" * 90,
+        f"  BENCHMARK RESULTS — {cfg.task_suite_name}",
+        f"  Checkpoint : {cfg.pretrained_checkpoint}",
+        f"  Inference  : {avg_inf*1000:.1f} ms/step  →  {inf_hz:.2f} Hz  (steps/sec)",
+        f"  Total steps: {total_steps}  |  Total inference time: {total_inf_s:.0f}s  ({total_inf_s/60:.1f} min)",
+        "=" * 90,
+        f"  {'Task':<45} {'SR':>7} {'Succ':>5} {'Eps':>5} {'Steps':>7} {'Steps/Ep':>9} {'InfTime':>9}",
+        "-" * 90,
+    ]
+    for desc, succ, eps, steps, task_avg in per_task_results:
+        sr = succ / eps * 100
+        avg_steps = steps / eps
+        inf_s = steps * task_avg  # exact: mean(this task's steps) × count = sum(this task's times)
+        summary_lines.append(
+            f"  {desc:<45} {sr:>6.1f}% {succ:>5} {eps:>5} {steps:>7} {avg_steps:>9.1f} {inf_s:>8.1f}s"
+        )
+    summary_lines += [
+        "-" * 90,
+        f"  {'TOTAL':<45} {total_successes/total_episodes*100:>6.1f}% {total_successes:>5} "
+        f"{total_episodes:>5} {total_steps:>7} {total_steps/total_episodes:>9.1f} {total_inf_s:>8.1f}s",
+        "=" * 90,
+        "",
+    ]
+    summary = "\n".join(summary_lines)
+    print(summary)
+    log_file.write(summary + "\n")
+    # ─────────────────────────────────────────────────────────────────────────────
     log_file.close()
 
     # Push total metrics and local log file to wandb
